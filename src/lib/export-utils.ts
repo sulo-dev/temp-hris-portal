@@ -1,5 +1,5 @@
 // src/lib/export-utils.ts
-import { Employee } from "@/lib/types";
+import { Employee, PayrollItem } from "@/lib/types";
 import { maskSensitiveValue } from "@/lib/security-utils";
 
 export interface ExportFilterMeta {
@@ -688,6 +688,85 @@ export function exportApprovalsToCsv(
     request.status,
     request.reason,
     request.reviewerNote ?? "-",
+  ]);
+
+  const csvLines = [
+    `sep=${delimiter}`,
+    headers.map((h) => sanitizeCsvCell(h, delimiter)).join(delimiter),
+    ...csvRows.map((row) =>
+      row.map((cell) => sanitizeCsvCell(cell, delimiter)).join(delimiter),
+    ),
+  ];
+
+  const blob = new Blob([csvLines.join("\r\n")], {
+    type: "text/csv;charset=utf-8;",
+  });
+  triggerBrowserDownload(blob, filename);
+
+  return filename;
+}
+
+export interface PayrollExportRow {
+  item: PayrollItem;
+  employee: Employee;
+}
+
+/**
+ * Ekspor rekap payroll periode aktif ke CSV (sep=; + angka murni agar langsung bisa di-SUM di Excel)
+ */
+export function exportPayrollToCsv(
+  rows: PayrollExportRow[],
+  period: string,
+): string {
+  const filename = `PT-Sulo_Rekap-Payroll_${period}.csv`;
+  const delimiter = ";";
+
+  const sortedRows = [...rows].sort(
+    (a, b) =>
+      a.employee.department.localeCompare(b.employee.department, "id") ||
+      a.employee.nip.localeCompare(b.employee.nip, "id"),
+  );
+
+  const headers = [
+    "NO",
+    "PERIODE",
+    "NIP",
+    "NAMA LENGKAP",
+    "DEPARTEMEN",
+    "JABATAN",
+    "GAJI POKOK (IDR)",
+    "TUNJANGAN TETAP (IDR)",
+    "UANG LEMBUR (IDR)",
+    "TOTAL PENERIMAAN (IDR)",
+    "POTONGAN TELAT (IDR)",
+    "BPJS KESEHATAN 1% (IDR)",
+    "BPJS TK JHT 2% (IDR)",
+    "PPH 21 TER (IDR)",
+    "TOTAL POTONGAN (IDR)",
+    "TAKE HOME PAY (IDR)",
+    "STATUS",
+    "HASH VERIFIKASI",
+  ];
+
+  const csvRows = sortedRows.map(({ item, employee }, idx) => [
+    String(idx + 1).padStart(3, "0"),
+    item.period,
+    employee.nip.toUpperCase(),
+    employee.fullName.trim(),
+    employee.department,
+    employee.position,
+    item.baseSalary,
+    item.fixedAllowance,
+    item.overtimePay,
+    item.totalEarnings,
+    item.lateDeduction,
+    item.bpjsKesehatan,
+    item.bpjsTkJht,
+    item.pph21,
+    item.totalDeductions,
+    item.takeHomePay,
+    item.status,
+    item.verificationHash,
   ]);
 
   const csvLines = [
