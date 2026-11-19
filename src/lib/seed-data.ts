@@ -6,8 +6,74 @@ import {
   LeaveRequest,
   PayrollItem,
   SecurityAuditEntry,
+  UserRole,
 } from "./types";
 import { computeEmployeePayroll } from "./business-rules";
+
+/**
+ * Kredensial Demo Utama SuloHR
+ * Kata sandi berlaku untuk seluruh akun evaluasi (atau gunakan NIP masing-masing karyawan).
+ */
+export const DEMO_DEFAULT_PASSWORD = "sulohr2026";
+
+export interface DemoAccountPreset {
+  employeeId: string;
+  nip: string;
+  email: string;
+  password: string;
+  fullName: string;
+  department: DepartmentName;
+  position: string;
+  role: UserRole;
+  highlight: string;
+}
+
+export const DEMO_ACCOUNTS: DemoAccountPreset[] = [
+  {
+    employeeId: "emp-001",
+    nip: "SLO-2026-001",
+    email: "rina.kusuma@sulo.co.id",
+    password: DEMO_DEFAULT_PASSWORD,
+    fullName: "Rina Kusuma",
+    department: "HR",
+    position: "HR Manager",
+    role: "HR_ADMIN",
+    highlight: "Akses penuh HR Admin Console, Payroll & PII Vault",
+  },
+  {
+    employeeId: "emp-002",
+    nip: "SLO-2026-002",
+    email: "dimas.pratama@sulo.co.id",
+    password: DEMO_DEFAULT_PASSWORD,
+    fullName: "Dimas Pratama",
+    department: "Engineering",
+    position: "Senior Frontend Engineer",
+    role: "EMPLOYEE",
+    highlight: "Portal ESS (Siap demo Clock-In & 1 pengajuan cuti pending)",
+  },
+  {
+    employeeId: "emp-005",
+    nip: "SLO-2026-005",
+    email: "tari.maharani5@sulo.co.id",
+    password: DEMO_DEFAULT_PASSWORD,
+    fullName: "Tari Maharani",
+    department: "HR",
+    position: "People Operations",
+    role: "HR_ADMIN",
+    highlight: "Akun HR Operations (Akses Admin & ESS)",
+  },
+  {
+    employeeId: "emp-004",
+    nip: "SLO-2026-004",
+    email: "fajar.saputra4@sulo.co.id",
+    password: DEMO_DEFAULT_PASSWORD,
+    fullName: "Fajar Saputra",
+    department: "Finance",
+    position: "Financial Controller",
+    role: "EMPLOYEE",
+    highlight: "Portal ESS Departemen Finance",
+  },
+];
 
 const DEPARTMENTS: {
   name: DepartmentName;
@@ -100,36 +166,36 @@ export function generateSeedEmployees(): Employee[] {
   const list: Employee[] = [];
 
   for (let i = 1; i <= 48; i += 1) {
+    const id = `emp-${String(i).padStart(3, "0")}`;
     const nip = `SLO-2026-${String(i).padStart(3, "0")}`;
-    let fullName = `${FIRST_NAMES[(i - 1) % FIRST_NAMES.length]} ${
-      LAST_NAMES[(i * 3) % LAST_NAMES.length]
-    }`;
-    let deptIndex = (i - 1) % DEPARTMENTS.length;
-    let position =
-      DEPARTMENTS[deptIndex].positions[
-        i % DEPARTMENTS[deptIndex].positions.length
-      ];
+    const preset = DEMO_ACCOUNTS.find((acc) => acc.employeeId === id);
 
-    if (i === 1) {
-      fullName = "Rina Kusuma";
-      deptIndex = 4; // HR
-      position = "HR Manager";
-    } else if (i === 2) {
-      fullName = "Dimas Pratama";
-      deptIndex = 0; // Engineering
-      position = "Senior Frontend Engineer";
-    }
+    const defaultDeptIndex = (i - 1) % DEPARTMENTS.length;
+    const deptName = preset?.department ?? DEPARTMENTS[defaultDeptIndex].name;
+    const dept =
+      DEPARTMENTS.find((d) => d.name === deptName) ??
+      DEPARTMENTS[defaultDeptIndex];
 
-    const dept = DEPARTMENTS[deptIndex];
+    const fullName =
+      preset?.fullName ??
+      `${FIRST_NAMES[(i - 1) % FIRST_NAMES.length]} ${
+        LAST_NAMES[(i * 3) % LAST_NAMES.length]
+      }`;
+
+    const position =
+      preset?.position ?? dept.positions[i % dept.positions.length];
+
     const slug = fullName.toLowerCase().replace(/[^a-z]+/g, ".");
+    const email = preset?.email ?? `${slug}${i > 2 ? i : ""}@sulo.co.id`;
+
     const isPkwt = i % 6 === 0;
     const isExpiringSoon = i === 6 || i === 12 || i === 18;
 
     list.push({
-      id: `emp-${String(i).padStart(3, "0")}`,
+      id,
       nip,
       fullName,
-      email: `${slug}${i > 2 ? i : ""}@sulo.co.id`,
+      email,
       phone: `0812${String(34000000 + i * 7919).slice(0, 8)}`,
       nik: `73710${String(10000000000 + i * 19457).slice(0, 11)}`,
       bankName: i % 2 === 0 ? "BCA" : "Mandiri",
@@ -158,7 +224,7 @@ export function generateSeedAttendance(
   todayStr: string,
 ): AttendanceRecord[] {
   return employees.map((emp, idx) => {
-    // 45/48 hadir (93.7%), 2 cuti/izin, 1 belum absen (Dimas Pratama agar bisa demo Clock-In)
+    // Dimas Pratama (emp-002) diset BELUM_ABSEN agar siap dipakai demo Clock-In
     if (emp.id === "emp-002") {
       return {
         id: `att-${todayStr}-${emp.id}`,

@@ -12,6 +12,7 @@ import {
   WorkMode,
 } from "@/lib/types";
 import {
+  DEMO_DEFAULT_PASSWORD,
   generateInitialAuditLogs,
   generateSeedAttendance,
   generateSeedEmployees,
@@ -26,23 +27,72 @@ import {
 import { computeVaultChecksum } from "@/lib/security-utils";
 
 const STORAGE_KEY = "sulohris_vault_v3";
+export const AUTH_SESSION_KEY = "sulohr_auth_session";
 
 function getTodayIso(): string {
   return new Date().toISOString().slice(0, 10);
 }
 
+function syncBrowserAuthSession(status: "authenticated" | "logged_out") {
+  if (typeof window === "undefined") return;
+  window.localStorage.setItem(AUTH_SESSION_KEY, status);
+}
+
+/**
+ * Validasi otoritas portal Admin:
+ * Hanya karyawan dari departemen HR yang memiliki hak akses HR_ADMIN.
+ * Karyawan departemen lain (Engineering, Product & Design, Marketing, Finance) hanya dapat mengakses ESS.
+ */
+export function canAccessAdminPortal(emp?: Employee): boolean {
+  return Boolean(emp && emp.department === "HR");
+}
+
+function resolveEmployeeDefaultRole(emp: Employee): UserRole {
+  return canAccessAdminPortal(emp) ? "HR_ADMIN" : "EMPLOYEE";
+}
+
+function getActiveActorName(
+  employees: Employee[],
+  activeUserId: string,
+  fallback = "HR Admin",
+): string {
+  return employees.find((e) => e.id === activeUserId)?.fullName ?? fallback;
+}
+
+export interface AuthActionResult {
+  ok: boolean;
+  message: string;
+  redirectTo?: "/admin/dashboard" | "/ess/home";
+  role?: UserRole;
+}
+
 interface SuloState {
+  // 1. Session & Vault State
   initialized: boolean;
+  isAuthenticated: boolean;
   activeRole: UserRole;
-  activeUserId: string; // "emp-001" (Rina Kusuma) | "emp-002" (Dimas Pratama)
+  activeUserId: string;
   privacyShield: boolean;
+
+  // 2. Domain Data
   employees: Employee[];
   attendance: AttendanceRecord[];
   leaves: LeaveRequest[];
   payrolls: PayrollItem[];
   auditLogs: SecurityAuditEntry[];
 
+  // 3. Vault & Auth Actions
   initVault: () => void;
+  loginWithCredentials: (
+    identifier: string,
+    password: string,
+    preferredRole?: UserRole,
+  ) => AuthActionResult;
+  loginAsEmployee: (
+    employeeId: string,
+    preferredRole?: UserRole,
+  ) => AuthActionResult;
+  logout: () => void;
   switchRole: (role: UserRole) => void;
   togglePrivacyShield: () => void;
   logSecurityEvent: (
@@ -51,7 +101,7 @@ interface SuloState {
     details: string,
   ) => void;
 
-  // Aksi HR Admin (Dilindungi Action-Level RBAC)
+  // 4. HR Admin Actions (Action-Level RBAC)
   addEmployee: (
     payload: Omit<
       Employee,
@@ -72,7 +122,7 @@ interface SuloState {
   runPayrollCalculation: (period: string) => { ok: boolean; message: string };
   lockAndPayPeriod: (period: string) => { ok: boolean; message: string };
 
-  // Aksi Karyawan / ESS
+  // 5. Employee Self-Service (ESS) Actions
   clockInToday: (workMode: WorkMode) => { ok: boolean; message: string };
   clockOutToday: () => { ok: boolean; message: string };
   submitLeaveRequest: (payload: {
@@ -86,27 +136,39 @@ interface SuloState {
   resetDemoVault: () => void;
 }
 
-function persistVault(
-  state: Pick<
-    SuloState,
-    | "activeRole"
-    | "activeUserId"
-    | "privacyShield"
-    | "employees"
-    | "attendance"
-    | "leaves"
-    | "payrolls"
-    | "auditLogs"
-  >,
-) {
+type PersistedVaultData = Pick<
+  SuloState,
+  | "isAuthenticated"
+  | "activeRole"
+  | "activeUserId"
+  | "privacyShield"
+  | "employees"
+  | "attendance"
+  | "leaves"
+  | "payrolls"
+  | "auditLogs"
+>;
+
+function persistVault(state: PersistedVaultData) {
   if (typeof window === "undefined") return;
-  const serialized = JSON.stringify(state);
-  const checksum = computeVaultChecksum(serialized);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify({ checksum, data: state }));
+  const payload: PersistedVaultData = {
+    isAuthenticated: state.isAuthenticated,
+    activeRole: state.activeRole,
+    activeUserId: state.activeUserId,
+    privacyShield: state.privacyShield,
+    employees: state.employees,
+    attendance: state.attendance,
+    leaves: state.leaves,
+    payrolls: state.payrolls,
+    auditLogs: state.auditLogs,
+  };
+  const checksum = computeVaultChecksum(JSON.stringify(payload));
+  localStorage.setItem(STORAGE_KEY, JSON.stringify({ checksum, data: payload }));
 }
 
 export const useSuloStore = create<SuloState>((set, get) => ({
   initialized: false,
+  isAuthenticated: true,
   activeRole: "HR_ADMIN",
   activeUserId: "emp-001",
   privacyShield: false,
@@ -116,12 +178,17 @@ export const useSuloStore = create<SuloState>((set, get) => ({
   payrolls: [],
   auditLogs: [],
 
+  // =========================================================================
+  // 1. INISIALISASI VAULT & ENFORCEMENT PERAN
+  // =========================================================================
   initVault: () => {
     if (get().initialized) return;
     const today = getTodayIso();
 
     if (typeof window !== "undefined") {
+      const browserAuth = window.localStorage.getItem(AUTH_SESSION_KEY);
       const raw = localStorage.getItem(STORAGE_KEY);
+
       if (raw) {
         try {
           const parsed = JSON.parse(raw);
@@ -132,13 +199,37 @@ export const useSuloStore = create<SuloState>((set, get) => ({
             parsed.checksum === expectedChecksum &&
             Array.isArray(parsed.data?.employees)
           ) {
-            set({ ...parsed.data, initialized: true });
+            const loadedEmployees: Employee[] = parsed.data.employees;
+            const activeEmp = loadedEmployees.find(
+              (e) => e.id === parsed.data.activeUserId,
+            );
+
+            // Paksa downgrade ke EMPLOYEE jika sesi tersimpan mengklaim HR_ADMIN untuk non-HR
+            const enforcedRole: UserRole =
+              parsed.data.activeRole === "HR_ADMIN" &&
+              canAccessAdminPortal(activeEmp)
+                ? "HR_ADMIN"
+                : "EMPLOYEE";
+
+            const isAuth =
+              browserAuth === "logged_out"
+                ? false
+                : (parsed.data.isAuthenticated ?? true);
+
+            set({
+              ...parsed.data,
+              activeRole: enforcedRole,
+              isAuthenticated: isAuth,
+              initialized: true,
+            });
             return;
           }
-          // Deteksi manipulasi JSON -> pemulihan otomatis
+
+          // Pemulihan otomatis jika checksum localStorage termanipulasi
           const seedEmployees = generateSeedEmployees();
-          const recovered = {
-            activeRole: "HR_ADMIN" as UserRole,
+          const recovered: PersistedVaultData = {
+            isAuthenticated: browserAuth !== "logged_out",
+            activeRole: "HR_ADMIN",
             activeUserId: "emp-001",
             privacyShield: false,
             employees: seedEmployees,
@@ -150,9 +241,9 @@ export const useSuloStore = create<SuloState>((set, get) => ({
                 id: `AUD-${Date.now()}`,
                 timestamp: new Date().toISOString(),
                 actorName: "Tamper Guard",
-                actorRole: "HR_ADMIN" as UserRole,
+                actorRole: "HR_ADMIN",
                 action: "VAULT_TAMPER_RECOVERED",
-                severity: "CRITICAL" as const,
+                severity: "CRITICAL",
                 details:
                   "Anomali checksum terdeteksi pada localStorage. Snapshot aman dipulihkan.",
               },
@@ -162,14 +253,20 @@ export const useSuloStore = create<SuloState>((set, get) => ({
           set({ ...recovered, initialized: true });
           return;
         } catch {
-          // Lanjut inisialisasi bersih
+          // Lanjut ke inisialisasi awal bersih
         }
       }
     }
 
     const employees = generateSeedEmployees();
-    const initial = {
-      activeRole: "HR_ADMIN" as UserRole,
+    const isAuth =
+      typeof window === "undefined"
+        ? true
+        : window.localStorage.getItem(AUTH_SESSION_KEY) !== "logged_out";
+
+    const initial: PersistedVaultData = {
+      isAuthenticated: isAuth,
+      activeRole: "HR_ADMIN",
       activeUserId: "emp-001",
       privacyShield: false,
       employees,
@@ -182,10 +279,192 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     set({ ...initial, initialized: true });
   },
 
+  // =========================================================================
+  // 2. AUTENTIKASI (LOGIN & LOGOUT DENGAN PEMBATASAN PORTAL KARYAWAN)
+  // =========================================================================
+  loginWithCredentials: (identifier, password, preferredRole) => {
+    if (!get().initialized) {
+      get().initVault();
+    }
+
+    const cleanId = identifier.trim().toLowerCase();
+    const cleanPass = password.trim();
+
+    if (!cleanId) {
+      return { ok: false, message: "Masukkan NIP atau email perusahaan Anda." };
+    }
+    if (!cleanPass) {
+      return { ok: false, message: "Kata sandi wajib diisi." };
+    }
+
+    const state = get();
+    const matchedEmployee = state.employees.find(
+      (emp) =>
+        emp.nip.toLowerCase() === cleanId ||
+        emp.email.toLowerCase() === cleanId,
+    );
+
+    if (!matchedEmployee) {
+      state.logSecurityEvent(
+        "AUTH_LOGIN_FAILED",
+        "WARNING",
+        `Percobaan login gagal: identitas '${identifier.trim()}' tidak ditemukan.`,
+      );
+      return {
+        ok: false,
+        message:
+          "NIP atau email tidak terdaftar. Contoh valid: SLO-2026-001 atau rina.kusuma@sulo.co.id.",
+      };
+    }
+
+    const validPasswords = [
+      DEMO_DEFAULT_PASSWORD.toLowerCase(),
+      matchedEmployee.nip.toLowerCase(),
+    ];
+
+    if (!validPasswords.includes(cleanPass.toLowerCase())) {
+      state.logSecurityEvent(
+        "AUTH_LOGIN_FAILED",
+        "WARNING",
+        `Kata sandi salah untuk akun ${matchedEmployee.fullName} (${matchedEmployee.nip}).`,
+      );
+      return {
+        ok: false,
+        message: `Kata sandi salah. Gunakan "${DEMO_DEFAULT_PASSWORD}" atau NIP karyawan.`,
+      };
+    }
+
+    return get().loginAsEmployee(matchedEmployee.id, preferredRole);
+  },
+
+  loginAsEmployee: (employeeId, preferredRole) => {
+    if (!get().initialized) {
+      get().initVault();
+    }
+
+    const state = get();
+    const targetEmp = state.employees.find((e) => e.id === employeeId);
+    if (!targetEmp) {
+      return { ok: false, message: "Akun karyawan tidak ditemukan di vault." };
+    }
+
+    const isHrEligible = canAccessAdminPortal(targetEmp);
+
+    // Tolak keras jika karyawan non-HR mencoba masuk ke workspace HR_ADMIN
+    if (!isHrEligible && preferredRole === "HR_ADMIN") {
+      state.logSecurityEvent(
+        "AUTH_ADMIN_ACCESS_DENIED",
+        "WARNING",
+        `Karyawan ${targetEmp.fullName} (${targetEmp.nip} - ${targetEmp.department}) ditolak masuk ke HR Admin Console.`,
+      );
+      return {
+        ok: false,
+        message: `Akses ditolak: Karyawan (${targetEmp.department}) hanya dapat masuk ke Portal ESS.`,
+      };
+    }
+
+    const finalRole: UserRole =
+      isHrEligible && preferredRole
+        ? preferredRole
+        : resolveEmployeeDefaultRole(targetEmp);
+
+    syncBrowserAuthSession("authenticated");
+
+    set((s) => {
+      const nextLogs: SecurityAuditEntry[] = [
+        {
+          id: `AUD-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          actorName: targetEmp.fullName,
+          actorRole: finalRole,
+          action: "AUTH_LOGIN_SUCCESS",
+          severity: "INFO",
+          details: `${targetEmp.fullName} (${targetEmp.nip}) masuk ke ${
+            finalRole === "HR_ADMIN" ? "HR Admin Console" : "Portal ESS"
+          }.`,
+        },
+        ...s.auditLogs,
+      ];
+      const next: PersistedVaultData = {
+        ...s,
+        isAuthenticated: true,
+        activeUserId: targetEmp.id,
+        activeRole: finalRole,
+        auditLogs: nextLogs,
+      };
+      persistVault(next);
+      return next;
+    });
+
+    return {
+      ok: true,
+      role: finalRole,
+      redirectTo:
+        finalRole === "HR_ADMIN" ? "/admin/dashboard" : "/ess/home",
+      message: `Selamat datang, ${targetEmp.fullName} (${targetEmp.nip})!`,
+    };
+  },
+
+  logout: () => {
+    syncBrowserAuthSession("logged_out");
+    set((s) => {
+      const actorName = getActiveActorName(
+        s.employees,
+        s.activeUserId,
+        "Pengguna",
+      );
+      const nextLogs: SecurityAuditEntry[] = [
+        {
+          id: `AUD-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          actorName,
+          actorRole: s.activeRole,
+          action: "AUTH_LOGOUT",
+          severity: "INFO",
+          details: `Sesi diakhiri oleh ${actorName}.`,
+        },
+        ...s.auditLogs,
+      ];
+      const next: PersistedVaultData = {
+        ...s,
+        isAuthenticated: false,
+        auditLogs: nextLogs,
+      };
+      persistVault(next);
+      return next;
+    });
+  },
+
   switchRole: (role) => {
-    const activeUserId = role === "HR_ADMIN" ? "emp-001" : "emp-002";
-    const actorName = role === "HR_ADMIN" ? "Rina Kusuma" : "Dimas Pratama";
-    set((state) => {
+    const state = get();
+    const currentEmp = state.employees.find((e) => e.id === state.activeUserId);
+
+    // Cegah eskalasi peran ke HR_ADMIN jika akun aktif bukan departemen HR
+    if (role === "HR_ADMIN" && !canAccessAdminPortal(currentEmp)) {
+      state.logSecurityEvent(
+        "UNAUTHORIZED_ROLE_SWITCH",
+        "CRITICAL",
+        `Percobaan eskalasi peran ke HR_ADMIN oleh ${
+          currentEmp?.fullName ?? state.activeUserId
+        } diblokir.`,
+      );
+      return;
+    }
+
+    const nextUserId =
+      currentEmp && canAccessAdminPortal(currentEmp)
+        ? currentEmp.id
+        : role === "HR_ADMIN"
+          ? "emp-001"
+          : "emp-002";
+
+    syncBrowserAuthSession("authenticated");
+    set((s) => {
+      const actorName = getActiveActorName(
+        s.employees,
+        nextUserId,
+        role === "HR_ADMIN" ? "Rina Kusuma" : "Dimas Pratama",
+      );
       const nextLogs: SecurityAuditEntry[] = [
         {
           id: `AUD-${Date.now()}`,
@@ -196,12 +475,13 @@ export const useSuloStore = create<SuloState>((set, get) => ({
           severity: "INFO",
           details: `Sesi aktif beralih ke peran ${role} (${actorName}).`,
         },
-        ...state.auditLogs,
+        ...s.auditLogs,
       ];
-      const next = {
-        ...state,
+      const next: PersistedVaultData = {
+        ...s,
+        isAuthenticated: true,
         activeRole: role,
-        activeUserId,
+        activeUserId: nextUserId,
         auditLogs: nextLogs,
       };
       persistVault(next);
@@ -212,12 +492,16 @@ export const useSuloStore = create<SuloState>((set, get) => ({
   togglePrivacyShield: () => {
     set((state) => {
       const nextShield = !state.privacyShield;
-      const actor = state.employees.find((e) => e.id === state.activeUserId);
+      const actorName = getActiveActorName(
+        state.employees,
+        state.activeUserId,
+        "System",
+      );
       const nextLogs: SecurityAuditEntry[] = [
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: actor?.fullName ?? "System",
+          actorName,
           actorRole: state.activeRole,
           action: nextShield ? "PRIVACY_SHIELD_ON" : "PRIVACY_SHIELD_OFF",
           severity: "INFO",
@@ -225,7 +509,11 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         },
         ...state.auditLogs,
       ];
-      const next = { ...state, privacyShield: nextShield, auditLogs: nextLogs };
+      const next: PersistedVaultData = {
+        ...state,
+        privacyShield: nextShield,
+        auditLogs: nextLogs,
+      };
       persistVault(next);
       return next;
     });
@@ -233,12 +521,16 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   logSecurityEvent: (action, severity, details) => {
     set((state) => {
-      const actor = state.employees.find((e) => e.id === state.activeUserId);
+      const actorName = getActiveActorName(
+        state.employees,
+        state.activeUserId,
+        "Visitor",
+      );
       const nextLogs: SecurityAuditEntry[] = [
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: actor?.fullName ?? "Visitor",
+          actorName,
           actorRole: state.activeRole,
           action,
           severity,
@@ -246,15 +538,19 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         },
         ...state.auditLogs,
       ];
-      const next = { ...state, auditLogs: nextLogs };
+      const next: PersistedVaultData = { ...state, auditLogs: nextLogs };
       persistVault(next);
       return next;
     });
   },
 
+  // =========================================================================
+  // 3. AKSI HR ADMIN (ACTION-LEVEL RBAC)
+  // =========================================================================
   addEmployee: (payload) => {
     const state = get();
-    if (state.activeRole !== "HR_ADMIN") {
+    const activeEmp = state.employees.find((e) => e.id === state.activeUserId);
+    if (state.activeRole !== "HR_ADMIN" || !canAccessAdminPortal(activeEmp)) {
       state.logSecurityEvent(
         "UNAUTHORIZED_MUTATION",
         "CRITICAL",
@@ -276,19 +572,20 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     };
 
     set((s) => {
+      const actorName = getActiveActorName(s.employees, s.activeUserId);
       const nextLogs: SecurityAuditEntry[] = [
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: "Rina Kusuma",
+          actorName,
           actorRole: "HR_ADMIN",
           action: "EMPLOYEE_CREATED",
           severity: "INFO",
-          details: `Menambahkan karyawan baru ${newEmp.fullName} (${newEmp.nip}).`,
+          details: `Menambahkan karyawan baru ${newEmp.fullName} (${newEmp.nip} - ${newEmp.department}).`,
         },
         ...s.auditLogs,
       ];
-      const next = {
+      const next: PersistedVaultData = {
         ...s,
         employees: [newEmp, ...s.employees],
         auditLogs: nextLogs,
@@ -305,7 +602,8 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   correctAttendance: (recordId, clockIn, clockOut, reason) => {
     const state = get();
-    if (state.activeRole !== "HR_ADMIN") {
+    const activeEmp = state.employees.find((e) => e.id === state.activeUserId);
+    if (state.activeRole !== "HR_ADMIN" || !canAccessAdminPortal(activeEmp)) {
       return { ok: false, message: "Akses ditolak." };
     }
     if (!reason.trim()) {
@@ -319,6 +617,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     const nowTime = new Date().toTimeString().slice(0, 5);
 
     set((s) => {
+      const actorName = getActiveActorName(s.employees, s.activeUserId);
       const updated = s.attendance.map((rec) =>
         rec.id === recordId
           ? {
@@ -327,7 +626,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
               clockOut,
               status: evalResult.status,
               lateMinutes: evalResult.lateMinutes,
-              auditNote: `Edited by Rina Kusuma at ${nowTime} — ${reason.trim()}`,
+              auditNote: `Edited by ${actorName} at ${nowTime} — ${reason.trim()}`,
             }
           : rec,
       );
@@ -335,7 +634,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: "Rina Kusuma",
+          actorName,
           actorRole: "HR_ADMIN",
           action: "ATTENDANCE_CORRECTED",
           severity: "WARNING",
@@ -343,7 +642,11 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         },
         ...s.auditLogs,
       ];
-      const next = { ...s, attendance: updated, auditLogs: nextLogs };
+      const next: PersistedVaultData = {
+        ...s,
+        attendance: updated,
+        auditLogs: nextLogs,
+      };
       persistVault(next);
       return next;
     });
@@ -356,7 +659,8 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   reviewLeaveRequest: (leaveId, decision, rejectionReason) => {
     const state = get();
-    if (state.activeRole !== "HR_ADMIN") {
+    const activeEmp = state.employees.find((e) => e.id === state.activeUserId);
+    if (state.activeRole !== "HR_ADMIN" || !canAccessAdminPortal(activeEmp)) {
       return { ok: false, message: "Akses ditolak." };
     }
     if (decision === "REJECTED" && !rejectionReason?.trim()) {
@@ -367,12 +671,13 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     if (!target) return { ok: false, message: "Pengajuan tidak ditemukan." };
 
     set((s) => {
+      const actorName = getActiveActorName(s.employees, s.activeUserId);
       const updatedLeaves = s.leaves.map((l) =>
         l.id === leaveId
           ? {
               ...l,
               status: decision,
-              reviewedBy: "Rina Kusuma",
+              reviewedBy: actorName,
               reviewedAt: new Date().toISOString(),
               rejectionReason:
                 decision === "REJECTED" ? rejectionReason?.trim() : undefined,
@@ -380,7 +685,6 @@ export const useSuloStore = create<SuloState>((set, get) => ({
           : l,
       );
 
-      // Potong kuota hanya jika APPROVED dan jenis CUTI_TAHUNAN
       const updatedEmployees =
         decision === "APPROVED" && target.type === "CUTI_TAHUNAN"
           ? s.employees.map((emp) =>
@@ -400,7 +704,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: "Rina Kusuma",
+          actorName,
           actorRole: "HR_ADMIN",
           action: `LEAVE_${decision}`,
           severity: "INFO",
@@ -409,7 +713,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         ...s.auditLogs,
       ];
 
-      const next = {
+      const next: PersistedVaultData = {
         ...s,
         leaves: updatedLeaves,
         employees: updatedEmployees,
@@ -430,7 +734,8 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   runPayrollCalculation: (period) => {
     const state = get();
-    if (state.activeRole !== "HR_ADMIN") {
+    const activeEmp = state.employees.find((e) => e.id === state.activeUserId);
+    if (state.activeRole !== "HR_ADMIN" || !canAccessAdminPortal(activeEmp)) {
       return { ok: false, message: "Akses ditolak." };
     }
     const isLocked = state.payrolls.some(
@@ -441,6 +746,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     }
 
     set((s) => {
+      const actorName = getActiveActorName(s.employees, s.activeUserId);
       const otherPeriods = s.payrolls.filter((p) => p.period !== period);
       const recalculated = s.employees.map((emp) => {
         const lateCount = s.attendance.filter(
@@ -459,7 +765,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: "Rina Kusuma",
+          actorName,
           actorRole: "HR_ADMIN",
           action: "PAYROLL_CALCULATED",
           severity: "INFO",
@@ -468,7 +774,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         ...s.auditLogs,
       ];
 
-      const next = {
+      const next: PersistedVaultData = {
         ...s,
         payrolls: [...otherPeriods, ...recalculated],
         auditLogs: nextLogs,
@@ -485,11 +791,13 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   lockAndPayPeriod: (period) => {
     const state = get();
-    if (state.activeRole !== "HR_ADMIN") {
+    const activeEmp = state.employees.find((e) => e.id === state.activeUserId);
+    if (state.activeRole !== "HR_ADMIN" || !canAccessAdminPortal(activeEmp)) {
       return { ok: false, message: "Akses ditolak." };
     }
 
     set((s) => {
+      const actorName = getActiveActorName(s.employees, s.activeUserId);
       const updated = s.payrolls.map((p) =>
         p.period === period
           ? { ...p, status: "PAID" as const, paidAt: new Date().toISOString() }
@@ -499,7 +807,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         {
           id: `AUD-${Date.now()}`,
           timestamp: new Date().toISOString(),
-          actorName: "Rina Kusuma",
+          actorName,
           actorRole: "HR_ADMIN",
           action: "PAYROLL_LOCKED_PAID",
           severity: "WARNING",
@@ -507,7 +815,11 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         },
         ...s.auditLogs,
       ];
-      const next = { ...s, payrolls: updated, auditLogs: nextLogs };
+      const next: PersistedVaultData = {
+        ...s,
+        payrolls: updated,
+        auditLogs: nextLogs,
+      };
       persistVault(next);
       return next;
     });
@@ -518,8 +830,12 @@ export const useSuloStore = create<SuloState>((set, get) => ({
     };
   },
 
+  // =========================================================================
+  // 4. AKSI KARYAWAN / ESS
+  // =========================================================================
   clockInToday: (workMode) => {
     const state = get();
+    const emp = state.employees.find((e) => e.id === state.activeUserId);
     const today = getTodayIso();
     const nowTime = new Date().toTimeString().slice(0, 8);
     const evalResult = evaluateClockIn(nowTime);
@@ -554,7 +870,24 @@ export const useSuloStore = create<SuloState>((set, get) => ({
             },
           ];
 
-      const next = { ...s, attendance: updated };
+      const nextLogs: SecurityAuditEntry[] = [
+        {
+          id: `AUD-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          actorName: emp?.fullName ?? s.activeUserId,
+          actorRole: s.activeRole,
+          action: "ESS_CLOCK_IN",
+          severity: "INFO",
+          details: `Clock-In (${workMode}) pukul ${nowTime} — ${evalResult.status}.`,
+        },
+        ...s.auditLogs,
+      ];
+
+      const next: PersistedVaultData = {
+        ...s,
+        attendance: updated,
+        auditLogs: nextLogs,
+      };
       persistVault(next);
       return next;
     });
@@ -571,7 +904,19 @@ export const useSuloStore = create<SuloState>((set, get) => ({
 
   clockOutToday: () => {
     const state = get();
+    const emp = state.employees.find((e) => e.id === state.activeUserId);
     const today = getTodayIso();
+    const todayRecord = state.attendance.find(
+      (a) => a.employeeId === state.activeUserId && a.date === today,
+    );
+
+    if (!todayRecord || !todayRecord.clockIn) {
+      return {
+        ok: false,
+        message: "Anda belum melakukan Clock-In hari ini.",
+      };
+    }
+
     const nowTime = new Date().toTimeString().slice(0, 8);
 
     set((s) => {
@@ -580,7 +925,23 @@ export const useSuloStore = create<SuloState>((set, get) => ({
           ? { ...a, clockOut: nowTime }
           : a,
       );
-      const next = { ...s, attendance: updated };
+      const nextLogs: SecurityAuditEntry[] = [
+        {
+          id: `AUD-${Date.now()}`,
+          timestamp: new Date().toISOString(),
+          actorName: emp?.fullName ?? s.activeUserId,
+          actorRole: s.activeRole,
+          action: "ESS_CLOCK_OUT",
+          severity: "INFO",
+          details: `Clock-Out tercatat pukul ${nowTime}.`,
+        },
+        ...s.auditLogs,
+      ];
+      const next: PersistedVaultData = {
+        ...s,
+        attendance: updated,
+        auditLogs: nextLogs,
+      };
       persistVault(next);
       return next;
     });
@@ -644,7 +1005,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
         },
         ...s.auditLogs,
       ];
-      const next = {
+      const next: PersistedVaultData = {
         ...s,
         leaves: [newRequest, ...s.leaves],
         auditLogs: nextLogs,
@@ -662,6 +1023,7 @@ export const useSuloStore = create<SuloState>((set, get) => ({
   resetDemoVault: () => {
     if (typeof window !== "undefined") {
       localStorage.removeItem(STORAGE_KEY);
+      localStorage.removeItem(AUTH_SESSION_KEY);
     }
     set({ initialized: false });
     get().initVault();
